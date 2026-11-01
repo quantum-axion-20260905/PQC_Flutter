@@ -113,8 +113,13 @@ class PqcV2AttachmentCodec {
     required String attachmentId,
     required int manifestSequence,
   }) async {
-    if (conversationEpochId.isEmpty || attachmentId.isEmpty) {
-      throw ArgumentError('Epoch id and attachment id must not be empty.');
+    if (conversationEpochId.isEmpty ||
+        attachmentId.isEmpty ||
+        manifestSequence < 0) {
+      throw ArgumentError(
+        'Epoch id and attachment id must be non-empty and manifest sequence '
+        'must not be negative.',
+      );
     }
     final material = await _primitives.deriveKey(
       secret: conversationEpochSecret,
@@ -195,8 +200,7 @@ class PqcV2AttachmentCodec {
         manifest.plaintextSize < 0 ||
         manifest.ciphertextSize < 0 ||
         manifest.totalChunks < 0 ||
-        manifest.recoveryManifestSequence < 0 ||
-        manifest.fileKeyWrap.trim().isEmpty) {
+        manifest.recoveryManifestSequence < 0) {
       throw const FormatException('Invalid attachment manifest metadata.');
     }
     final expectedChunks = manifest.plaintextSize == 0

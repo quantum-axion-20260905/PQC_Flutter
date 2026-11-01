@@ -51,7 +51,8 @@ class SdkV2GroupCipherMessageCodec extends GroupCipherMessageCodec {
         epochId: key.keyId,
         secretKeyBytes: key.secretKeyBytes,
       ),
-      sender: await _senderKeyset(),
+      sender: (await _senderKeyset()) ??
+          (throw StateError('Device keyset unavailable for group encryption.')),
     );
   }
 

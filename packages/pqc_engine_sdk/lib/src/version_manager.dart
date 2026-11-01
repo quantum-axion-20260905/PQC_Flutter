@@ -1,9 +1,60 @@
 import 'models.dart';
-import 'primitives.dart';
 import 'v2_engine.dart';
-import 'v3_engine.dart';
 
-enum PqcConversationKind { private, group, groupEnvelope }
+enum PqcConversationKind { private, group }
+
+class PqcWireProtocol {
+  const PqcWireProtocol({required this.id, required this.version});
+
+  final String id;
+  final int version;
+}
+
+abstract final class PqcWireProtocols {
+  static const v2 = PqcWireProtocol(id: 'v2', version: 2);
+  static const v3 = PqcWireProtocol(id: 'v3', version: 3);
+}
+
+class PqcEngineReleaseProfile {
+  const PqcEngineReleaseProfile({
+    required this.releaseId,
+    required this.wireProtocol,
+    required this.activeWriterEngineId,
+    required this.requiredDecoderIds,
+  });
+
+  final String releaseId;
+  final PqcWireProtocol wireProtocol;
+  final String activeWriterEngineId;
+  final Set<String> requiredDecoderIds;
+}
+
+abstract final class PqcReleaseProfiles {
+  static const v2 = PqcEngineReleaseProfile(
+    releaseId: '2.0.0',
+    wireProtocol: PqcWireProtocols.v2,
+    activeWriterEngineId: 'pqc-v2',
+    requiredDecoderIds: {'pqc-v2'},
+  );
+
+  /// V2.5 keeps the V2 protocol family while using authenticated V2 writes.
+  static const v25 = PqcEngineReleaseProfile(
+    releaseId: '2.5.0',
+    wireProtocol: PqcWireProtocols.v2,
+    activeWriterEngineId: 'pqc-v2.5-writer',
+    requiredDecoderIds: {'pqc-v2'},
+  );
+
+  /// V3 writes only its own wire format but permanently retains the V2 history
+  /// decoder. The release profile is intentionally separate from V2.5: an
+  /// application chooses one profile, it does not silently downgrade writes.
+  static const v3 = PqcEngineReleaseProfile(
+    releaseId: '3.0.0',
+    wireProtocol: PqcWireProtocols.v3,
+    activeWriterEngineId: 'pqc-v3',
+    requiredDecoderIds: {'pqc-v2', 'pqc-v3'},
+  );
+}
 
 class PqcCompatibilityException implements Exception {
   const PqcCompatibilityException(this.message);
@@ -21,165 +72,79 @@ class PqcCompatibilityException implements Exception {
 class PqcEngineManager {
   PqcEngineManager({
     required Iterable<PqcEngine> decoders,
+    PqcEngine? activeWriter,
     String? activeWriterId,
-    Map<PqcConversationKind, String>? activeWriterIds,
-    bool writerEnabled = false,
-  }) : this._(
-         decoders: _registerDecoders(decoders),
-         activeWriterId: activeWriterId,
-         activeWriterIds: activeWriterIds,
-         writerEnabled: writerEnabled,
-       );
-
-  PqcEngineManager._({
-    required Map<String, PqcEngine> decoders,
-    required String? activeWriterId,
-    required Map<PqcConversationKind, String>? activeWriterIds,
-    required this.writerEnabled,
-  }) : _decoders = decoders,
-       _activeWriterIds = _resolveWriterIds(
-         decoders: decoders,
-         activeWriterId: activeWriterId,
-         activeWriterIds: activeWriterIds,
-       );
-
-  /// Builds the production writer map for one of the shared release profiles.
-  ///
-  /// V3 intentionally uses the frozen V2 engine for group-key envelopes while
-  /// private and group messages use V3. This mixed mapping is part of the
-  /// compatibility contract and cannot be represented by one global writer
-  /// id.
-  factory PqcEngineManager.forRelease({
-    required PqcProtocolRelease release,
-    PqcPrimitiveSuite? primitives,
-    bool writerEnabled = false,
+    this.writerEnabled = false,
+    this.releaseProfile = PqcReleaseProfiles.v2,
   }) {
-    switch (release.profileId) {
-      case 'v2':
-        final v2 = PqcV2Engine(primitives: primitives);
-        return PqcEngineManager(
-          decoders: [v2],
-          activeWriterIds: {
-            for (final kind in PqcConversationKind.values) kind: v2.engineId,
-          },
-          writerEnabled: writerEnabled,
-        );
-      case 'v2.5':
-        final v25 = PqcV2Engine(
-          primitives: primitives,
-          enableV25GroupEnvelopeWriter: true,
-        );
-        return PqcEngineManager(
-          decoders: [v25],
-          activeWriterIds: {
-            for (final kind in PqcConversationKind.values) kind: v25.engineId,
-          },
-          writerEnabled: writerEnabled,
-        );
-      case 'v3':
-        final v2 = PqcV2Engine(primitives: primitives);
-        final v3 = PqcV3Engine(primitives: primitives);
-        return PqcEngineManager(
-          decoders: [v2, v3],
-          activeWriterIds: {
-            PqcConversationKind.private: v3.engineId,
-            PqcConversationKind.group: v3.engineId,
-            PqcConversationKind.groupEnvelope: v2.engineId,
-          },
-          writerEnabled: writerEnabled,
-        );
-      default:
-        throw ArgumentError.value(
-          release.profileId,
-          'release',
-          'Unsupported protocol release profile.',
-        );
-    }
-  }
-
-  final Map<String, PqcEngine> _decoders;
-  final Map<PqcConversationKind, String> _activeWriterIds;
-  final bool writerEnabled;
-
-  static Map<PqcConversationKind, String> _resolveWriterIds({
-    required Map<String, PqcEngine> decoders,
-    required String? activeWriterId,
-    required Map<PqcConversationKind, String>? activeWriterIds,
-  }) {
-    if (decoders.isEmpty) {
+    // A host may pass a lazy or single-use iterable. Materialize it once so
+    // validation and registration observe the same decoder set.
+    final decoderList = List<PqcEngine>.of(decoders, growable: false);
+    _decoders = {for (final engine in decoderList) engine.engineId: engine};
+    if (_decoders.isEmpty) {
       throw ArgumentError('At least one decoder must be registered.');
     }
-    if (activeWriterId != null && activeWriterIds != null) {
+    if (_decoders.length != decoderList.length) {
+      throw ArgumentError('Engine ids must be unique.');
+    }
+    if (activeWriter != null && activeWriterId != null) {
       throw ArgumentError(
-        'Provide activeWriterId or activeWriterIds, not both.',
+        'Use activeWriter or the legacy activeWriterId, not both.',
       );
     }
-    final selected = <PqcConversationKind, String>{};
-    if (activeWriterId != null) {
-      for (final kind in PqcConversationKind.values) {
-        selected[kind] = activeWriterId;
-      }
-    } else if (activeWriterIds != null) {
-      selected.addAll(activeWriterIds);
+    if (activeWriterId != null && !_decoders.containsKey(activeWriterId)) {
+      throw ArgumentError('Active writer must be a registered engine.');
     }
-    for (final entry in selected.entries) {
-      if (entry.value.trim().isEmpty || !decoders.containsKey(entry.value)) {
-        throw ArgumentError(
-          'Active writer for ${entry.key} must be a registered engine.',
-        );
-      }
+    final registeredWriter = activeWriter == null
+        ? null
+        : _decoders[activeWriter.engineId];
+    if (activeWriter != null &&
+        registeredWriter != null &&
+        !identical(registeredWriter, activeWriter)) {
+      throw ArgumentError(
+        'An active writer with a registered engine id must be the same instance '
+        'as that registered decoder.',
+      );
     }
-    return Map.unmodifiable(selected);
+    final missing = releaseProfile.requiredDecoderIds.difference(
+      _decoders.keys.toSet(),
+    );
+    if (missing.isNotEmpty) {
+      throw ArgumentError('Required historical decoders are missing: $missing');
+    }
+    _activeWriter =
+        activeWriter ??
+        (activeWriterId == null ? null : _decoders[activeWriterId]);
+    final writer = _activeWriter;
+    if (writer != null &&
+        (writer.wireProtocolId != releaseProfile.wireProtocol.id ||
+            writer.protocolVersion != releaseProfile.wireProtocol.version)) {
+      throw ArgumentError(
+        'Release ${releaseProfile.releaseId} requires wire protocol '
+        '${releaseProfile.wireProtocol.id}.',
+      );
+    }
+    if (writer != null &&
+        writer.engineId != releaseProfile.activeWriterEngineId) {
+      throw ArgumentError(
+        'Release ${releaseProfile.releaseId} requires writer '
+        '${releaseProfile.activeWriterEngineId}.',
+      );
+    }
   }
 
-  static Map<String, PqcEngine> _registerDecoders(Iterable<PqcEngine> source) {
-    final engines = List<PqcEngine>.of(source, growable: false);
-    final registered = <String, PqcEngine>{};
-    final privatePrefixes = <String>{};
-    final groupPrefixes = <String>{};
-    final groupEnvelopePrefixes = <String>{};
-    for (final engine in engines) {
-      if (engine.engineId.trim().isEmpty) {
-        throw ArgumentError('Engine ids must not be empty.');
-      }
-      if (engine.protocolVersion <= 0 ||
-          engine.privatePrefix.trim().isEmpty ||
-          engine.groupPrefix.trim().isEmpty) {
-        throw ArgumentError('Engine metadata must be stable and non-empty.');
-      }
-      if (registered.containsKey(engine.engineId)) {
-        throw ArgumentError('Engine ids must be unique.');
-      }
-      if (engine.attachmentCipherVersions.any((item) => item.trim().isEmpty) ||
-          engine.groupEnvelopeReadPrefixes.any((item) => item.trim().isEmpty) ||
-          engine.groupEnvelopeWritePrefixes.any(
-            (item) => item.trim().isEmpty,
-          ) ||
-          !privatePrefixes.add(engine.privatePrefix) ||
-          !groupPrefixes.add(engine.groupPrefix) ||
-          !engine.groupEnvelopeReadPrefixes.every(groupEnvelopePrefixes.add)) {
-        throw ArgumentError('Engine payload prefixes must be unique.');
-      }
-      registered[engine.engineId] = engine;
-    }
-    return registered;
-  }
+  late final Map<String, PqcEngine> _decoders;
+  late final PqcEngine? _activeWriter;
+  final bool writerEnabled;
+  final PqcEngineReleaseProfile releaseProfile;
+
+  String get releaseId => releaseProfile.releaseId;
+
+  String get wireProtocolId => releaseProfile.wireProtocol.id;
 
   List<PqcEngine> get decoders => List.unmodifiable(_decoders.values);
 
-  String? get activeWriterId => _activeWriterIds[PqcConversationKind.private];
-
-  PqcEngine? get activeWriter => activeWriterFor(PqcConversationKind.private);
-
-  PqcEngine? activeWriterFor(PqcConversationKind kind) {
-    final id = _activeWriterIds[kind];
-    return id == null ? null : _decoders[id];
-  }
-
-  Map<PqcConversationKind, PqcEngine> get activeWriters => {
-    for (final entry in _activeWriterIds.entries)
-      entry.key: _decoders[entry.value]!,
-  };
+  PqcEngine? get activeWriter => _activeWriter;
 
   PqcEngine resolveDecoder({
     required PqcConversationKind kind,
@@ -187,13 +152,9 @@ class PqcEngineManager {
   }) {
     final matches = _decoders.values
         .where((engine) {
-          return switch (kind) {
-            PqcConversationKind.private => engine.recognizesPrivate(payload),
-            PqcConversationKind.group => engine.recognizesGroup(payload),
-            PqcConversationKind.groupEnvelope => engine.recognizesGroupEnvelope(
-              payload,
-            ),
-          };
+          return kind == PqcConversationKind.private
+              ? engine.recognizesPrivate(payload)
+              : engine.recognizesGroup(payload);
         })
         .toList(growable: false);
     if (matches.isEmpty) {
@@ -210,53 +171,32 @@ class PqcEngineManager {
   PqcEngine requireWriter({
     required PqcConversationKind kind,
     required PqcRemoteCapabilities remote,
-    bool hasAttachments = false,
   }) {
-    final writer = activeWriterFor(kind);
+    final writer = activeWriter;
     if (!writerEnabled || writer == null) {
       throw const PqcCompatibilityException(
         'Encrypted writer is disabled by the production gate.',
       );
     }
-    if (kind == PqcConversationKind.groupEnvelope &&
-        (writer is! PqcGroupEnvelopeEngine ||
-            writer.groupEnvelopeWritePrefixes.isEmpty)) {
-      throw PqcCompatibilityException(
-        'The selected engine cannot encode group-key envelopes.',
-      );
-    }
-    final readable = switch (kind) {
-      PqcConversationKind.private => remote.privateReadPrefixes.contains(
-        writer.privatePrefix,
-      ),
-      PqcConversationKind.group => remote.groupReadPrefixes.contains(
-        writer.groupPrefix,
-      ),
-      PqcConversationKind.groupEnvelope =>
-        writer.groupEnvelopeWritePrefixes.every(
-          remote.groupEnvelopeReadPrefixes.contains,
-        ),
-    };
-    final writable = switch (kind) {
-      PqcConversationKind.private => remote.privateWritePrefixes.contains(
-        writer.privatePrefix,
-      ),
-      PqcConversationKind.group => remote.groupWritePrefixes.contains(
-        writer.groupPrefix,
-      ),
-      PqcConversationKind.groupEnvelope =>
-        writer.groupEnvelopeWritePrefixes.every(
-          remote.groupEnvelopeWritePrefixes.contains,
-        ),
-    };
+    final readable = kind == PqcConversationKind.private
+        ? remote.privateReadPrefixes.contains(writer.privatePrefix)
+        : remote.groupReadPrefixes.contains(writer.groupPrefix);
+    final writable = kind == PqcConversationKind.private
+        ? remote.privateWritePrefixes.contains(writer.privatePrefix)
+        : remote.groupWritePrefixes.contains(writer.groupPrefix);
     if (!readable || !writable) {
       throw PqcCompatibilityException(
         'Remote endpoint cannot safely read and write ${writer.engineId}.',
       );
     }
-    if (remote.minimumDecoderVersion <= 0) {
-      throw const PqcCompatibilityException(
-        'Remote endpoint did not provide a valid decoder version.',
+    final algorithmSupported = kind == PqcConversationKind.private
+        ? remote.privateAlgorithms.contains(writer.privateAlgorithm)
+        : remote.groupAlgorithms.contains(writer.groupAlgorithm);
+    if (!algorithmSupported) {
+      throw PqcCompatibilityException(
+        'Remote endpoint cannot read and write the authenticated '
+        '${kind == PqcConversationKind.private ? 'private' : 'group'} '
+        'algorithm for ${writer.engineId}.',
       );
     }
     if (writer.protocolVersion < remote.minimumDecoderVersion) {
@@ -265,10 +205,9 @@ class PqcEngineManager {
         '${remote.minimumDecoderVersion} or newer.',
       );
     }
-    if (hasAttachments &&
-        !writer.attachmentCipherVersions.every(
-          remote.attachmentCipherVersions.contains,
-        )) {
+    if (!writer.attachmentCipherVersions.every(
+      remote.attachmentCipherVersions.contains,
+    )) {
       throw const PqcCompatibilityException(
         'Attachment cipher capability mismatch.',
       );

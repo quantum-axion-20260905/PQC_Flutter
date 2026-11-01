@@ -2,52 +2,69 @@ import 'dart:convert';
 
 import 'models.dart';
 import 'primitives.dart';
+import 'v2_authenticated_group_codec.dart';
 
 class PqcV2GroupCodec {
-  PqcV2GroupCodec(this._primitives);
+  PqcV2GroupCodec(this._primitives)
+    : _authenticated = PqcV2AuthenticatedGroupCodec(
+        _primitives,
+        prefix: PqcV2Wire.groupPrefix,
+        algorithm: PqcV2Wire.groupAlgorithm,
+      );
 
   final PqcPrimitiveSuite _primitives;
+  final PqcV2AuthenticatedGroupCodec _authenticated;
+
+  PqcGroupPayloadMetadata? inspect(String payload) {
+    try {
+      if (!payload.startsWith('${PqcV2Wire.groupPrefix}:')) {
+        return null;
+      }
+      final document = _decode(
+        payload.substring(PqcV2Wire.groupPrefix.length + 1),
+      );
+      if (document['protocol_version'] != PqcV2Wire.protocolVersion ||
+          (document['algorithm'] != PqcV2Wire.groupAlgorithm &&
+              document['algorithm'] != PqcV2Wire.legacyGroupAlgorithm)) {
+        return null;
+      }
+      final conversationId = document['conversation_id'];
+      final conversationType = document['conversation_type'];
+      final epochId = document['group_epoch_id'];
+      if (conversationId is! int ||
+          conversationId <= 0 ||
+          conversationType is! String ||
+          epochId is! String ||
+          epochId.isEmpty) {
+        return null;
+      }
+      return PqcGroupPayloadMetadata(
+        conversationId: conversationId,
+        conversationType: conversationType,
+        epochId: epochId,
+      );
+    } catch (_) {
+      return null;
+    }
+  }
 
   Future<String> encrypt({
     required PqcConversation conversation,
     required String plaintext,
     required PqcGroupEpoch epoch,
-    PqcDeviceKeyset? sender,
-  }) async {
-    _validateEpoch(conversation, epoch);
-    final box = await _primitives.encryptAead(
-      plaintext: utf8.encode(plaintext),
-      key: epoch.secretKeyBytes,
-      nonce: _primitives.randomBytes(12),
-    );
-    final document = <String, dynamic>{
-      'protocol_version': PqcV2Wire.protocolVersion,
-      'algorithm': PqcV2Wire.groupAlgorithm,
-      'conversation_id': conversation.id,
-      'conversation_type': conversation.type,
-      'group_epoch_id': epoch.epochId,
-      'nonce': base64Encode(box.nonce),
-      'ciphertext': base64Encode(box.ciphertext),
-      'mac': base64Encode(box.mac),
-    };
-    if (sender != null) {
-      document['sender_device_id'] = sender.deviceId;
-      document['sender_keyset_id'] = sender.keysetId;
-      document['signing_public_key'] = sender.signingPublicKeyBase64;
-      document['signature'] = _primitives.sign(
-        message: utf8.encode(jsonEncode(document)),
-        secretKeyBase64: sender.signingSecretKeyBase64,
-      );
-    }
-    return '${PqcV2Wire.groupPrefix}:${_encode(document)}';
-  }
+    required PqcDeviceKeyset sender,
+  }) => _authenticated.encrypt(
+    conversation: conversation,
+    plaintext: plaintext,
+    epoch: epoch,
+    sender: sender,
+  );
 
   Future<PqcDecodeResult> decrypt({
     required PqcConversation conversation,
     required String payload,
     required Map<String, PqcGroupEpoch> epochsById,
     Map<String, Set<String>> trustedSigningKeysByDevice = const {},
-    bool requireAuthenticatedSender = false,
   }) async {
     if (!payload.startsWith('${PqcV2Wire.groupPrefix}:')) {
       return const PqcDecodeError(PqcDecodeFailure.unsupported);
@@ -57,43 +74,23 @@ class PqcV2GroupCodec {
         payload.substring(PqcV2Wire.groupPrefix.length + 1),
       );
       if (document['protocol_version'] != PqcV2Wire.protocolVersion ||
-          document['algorithm'] != PqcV2Wire.groupAlgorithm) {
+          (document['algorithm'] != PqcV2Wire.groupAlgorithm &&
+              document['algorithm'] != PqcV2Wire.legacyGroupAlgorithm)) {
         return const PqcDecodeError(PqcDecodeFailure.corrupted);
+      }
+      if (document['algorithm'] == PqcV2Wire.groupAlgorithm) {
+        return await _authenticated.decrypt(
+          conversation: conversation,
+          payload: payload,
+          epochsById: epochsById,
+          trustedSigningKeysByDevice: trustedSigningKeysByDevice,
+        );
       }
       if (document['conversation_id'] != conversation.id ||
           document['conversation_type'] != conversation.type ||
-          !conversation.isGroup) {
+          !conversation.isGroup ||
+          conversation.id <= 0) {
         return const PqcDecodeError(PqcDecodeFailure.bindingMismatch);
-      }
-      final signature = document['signature'] as String?;
-      final senderDeviceId = document['sender_device_id'] as String?;
-      final signingPublicKey = document['signing_public_key'] as String?;
-      final hasSenderAuthentication =
-          signature != null ||
-          senderDeviceId != null ||
-          signingPublicKey != null;
-      if (hasSenderAuthentication || requireAuthenticatedSender) {
-        final trusted = senderDeviceId == null
-            ? null
-            : trustedSigningKeysByDevice[senderDeviceId];
-        if (signature == null ||
-            senderDeviceId == null ||
-            signingPublicKey == null ||
-            senderDeviceId.isEmpty ||
-            signingPublicKey.isEmpty ||
-            trusted == null ||
-            !trusted.contains(signingPublicKey)) {
-          return const PqcDecodeError(PqcDecodeFailure.untrustedSender);
-        }
-        final unsigned = Map<String, dynamic>.from(document)
-          ..remove('signature');
-        if (!_primitives.verify(
-          message: utf8.encode(jsonEncode(unsigned)),
-          signatureBase64: signature,
-          publicKeyBase64: signingPublicKey,
-        )) {
-          return const PqcDecodeError(PqcDecodeFailure.corrupted);
-        }
       }
       final epochId = document['group_epoch_id'] as String? ?? '';
       final epoch = epochsById[epochId];
@@ -110,7 +107,7 @@ class PqcV2GroupCodec {
         key: epoch.secretKeyBytes,
       );
       return PqcDecoded(
-        plaintext: utf8.decode(clear),
+        plaintext: utf8.decode(clear, allowMalformed: false),
         protocolVersion: PqcV2Wire.protocolVersion,
       );
     } catch (error) {
@@ -128,6 +125,11 @@ class PqcV2GroupCodec {
     required PqcDevicePublicKey recipient,
   }) async {
     _validateEpoch(conversation, epoch);
+    if (sender.deviceId.contains(':') || recipient.deviceId.contains(':')) {
+      // The frozen V2 group-wrap format is colon-delimited. Reject ambiguous
+      // identities rather than emitting a payload that cannot be parsed back.
+      throw ArgumentError('V2 group-wrap device ids must not contain ":".');
+    }
     final kem = _primitives.encapsulate(recipient.kemPublicKeyBase64);
     final key = await _deriveWrapKey(
       sharedSecret: kem.sharedSecret,
@@ -166,6 +168,7 @@ class PqcV2GroupCodec {
   }) async {
     try {
       if (!conversation.isGroup ||
+          conversation.id <= 0 ||
           !wrappedEpoch.startsWith('${PqcV2Wire.groupWrapPrefix}:')) {
         return null;
       }
@@ -237,7 +240,7 @@ class PqcV2GroupCodec {
   }
 
   void _validateEpoch(PqcConversation conversation, PqcGroupEpoch epoch) {
-    if (!conversation.isGroup) {
+    if (!conversation.isGroup || conversation.id <= 0) {
       throw ArgumentError('Group codec requires a group conversation.');
     }
     if (epoch.epochId.isEmpty || epoch.secretKeyBytes.length != 32) {
@@ -246,15 +249,14 @@ class PqcV2GroupCodec {
   }
 }
 
-String _encode(Map<String, dynamic> value) =>
-    base64UrlEncode(utf8.encode(jsonEncode(value))).replaceAll('=', '');
-
 Map<String, dynamic> _decode(String encoded) {
   final padded = encoded.padRight(
     encoded.length + ((4 - encoded.length % 4) % 4),
     '=',
   );
-  final value = jsonDecode(utf8.decode(base64Url.decode(padded)));
+  final value = jsonDecode(
+    utf8.decode(base64Url.decode(padded), allowMalformed: false),
+  );
   if (value is! Map<String, dynamic>) {
     throw const FormatException('Group payload must be an object.');
   }

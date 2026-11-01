@@ -94,13 +94,15 @@ class PqcV3SdkPrimitiveSuite implements sdk.PqcPrimitiveSuite {
     required List<int> plaintext,
     required List<int> key,
     required List<int> nonce,
+    List<int> associatedData = const [],
     List<int> aad = const [],
   }) async {
+    final effectiveAad = aad.isNotEmpty ? aad : associatedData;
     final box = await _cipher.encrypt(
       plaintext,
       secretKey: SecretKey(key),
       nonce: nonce,
-      aad: aad,
+      aad: effectiveAad,
     );
     return sdk.PqcAeadBox(
       nonce: box.nonce,
@@ -113,12 +115,14 @@ class PqcV3SdkPrimitiveSuite implements sdk.PqcPrimitiveSuite {
   Future<Uint8List> decryptAead({
     required sdk.PqcAeadBox box,
     required List<int> key,
+    List<int> associatedData = const [],
     List<int> aad = const [],
   }) async {
+    final effectiveAad = aad.isNotEmpty ? aad : associatedData;
     final clear = await _cipher.decrypt(
       SecretBox(box.ciphertext, nonce: box.nonce, mac: Mac(box.mac)),
       secretKey: SecretKey(key),
-      aad: aad,
+      aad: effectiveAad,
     );
     return Uint8List.fromList(clear);
   }

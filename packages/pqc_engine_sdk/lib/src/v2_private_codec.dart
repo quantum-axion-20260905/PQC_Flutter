@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'dart:typed_data';
 
+import 'crypto_utils.dart';
 import 'models.dart';
 import 'primitives.dart';
 
@@ -15,7 +16,7 @@ class PqcV2PrivateCodec {
     required PqcDeviceKeyset sender,
     required Iterable<PqcDevicePublicKey> recipientDevices,
   }) async {
-    if (conversation.isGroup) {
+    if (conversation.id <= 0 || !conversation.isPrivate) {
       throw ArgumentError('Private codec cannot write a group conversation.');
     }
     final recipients = <String, PqcDevicePublicKey>{};
@@ -40,33 +41,44 @@ class PqcV2PrivateCodec {
     }
 
     final contentKey = _primitives.randomBytes(32);
-    final contentBox = await _primitives.encryptAead(
-      plaintext: utf8.encode(plaintext),
-      key: contentKey,
-      nonce: _primitives.randomBytes(12),
-    );
+    late final PqcAeadBox contentBox;
     final wraps = <Map<String, String>>[];
-    for (final device in recipients.values) {
-      final kem = _primitives.encapsulate(device.kemPublicKeyBase64);
-      final wrapKey = await _deriveWrapKey(
-        sharedSecret: kem.sharedSecret,
-        conversation: conversation,
-        senderDeviceId: sender.deviceId,
-        targetDeviceId: device.deviceId,
-      );
-      final wrapBox = await _primitives.encryptAead(
-        plaintext: contentKey,
-        key: wrapKey,
+    try {
+      contentBox = await _primitives.encryptAead(
+        plaintext: utf8.encode(plaintext),
+        key: contentKey,
         nonce: _primitives.randomBytes(12),
       );
-      wraps.add({
-        'target_device_id': device.deviceId,
-        'target_keyset_id': device.keysetId,
-        'kem_ciphertext': kem.ciphertextBase64,
-        'nonce': base64Encode(wrapBox.nonce),
-        'ciphertext': base64Encode(wrapBox.ciphertext),
-        'mac': base64Encode(wrapBox.mac),
-      });
+      for (final device in recipients.values) {
+        final kem = _primitives.encapsulate(device.kemPublicKeyBase64);
+        Uint8List? wrapKey;
+        try {
+          wrapKey = await _deriveWrapKey(
+            sharedSecret: kem.sharedSecret,
+            conversation: conversation,
+            senderDeviceId: sender.deviceId,
+            targetDeviceId: device.deviceId,
+          );
+          final wrapBox = await _primitives.encryptAead(
+            plaintext: contentKey,
+            key: wrapKey,
+            nonce: _primitives.randomBytes(12),
+          );
+          wraps.add({
+            'target_device_id': device.deviceId,
+            'target_keyset_id': device.keysetId,
+            'kem_ciphertext': kem.ciphertextBase64,
+            'nonce': base64Encode(wrapBox.nonce),
+            'ciphertext': base64Encode(wrapBox.ciphertext),
+            'mac': base64Encode(wrapBox.mac),
+          });
+        } finally {
+          kem.zeroize();
+          secureZero(wrapKey);
+        }
+      }
+    } finally {
+      secureZero(contentKey);
     }
 
     final unsigned = <String, dynamic>{
@@ -83,7 +95,7 @@ class PqcV2PrivateCodec {
       'wraps': wraps,
     };
     final signature = _primitives.sign(
-      message: utf8.encode(jsonEncode(unsigned)),
+      message: utf8.encode(canonicalJsonEncode(unsigned)),
       secretKeyBase64: sender.signingSecretKeyBase64,
     );
     return '${PqcV2Wire.privatePrefix}:${_encodeDocument({...unsigned, 'signature': signature})}';
@@ -106,7 +118,9 @@ class PqcV2PrivateCodec {
           document['algorithm'] != PqcV2Wire.privateAlgorithm) {
         return const PqcDecodeError(PqcDecodeFailure.corrupted);
       }
-      if (document['conversation_id'] != conversation.id ||
+      if (conversation.id <= 0 ||
+          !conversation.isPrivate ||
+          document['conversation_id'] != conversation.id ||
           document['conversation_type'] != conversation.type ||
           conversation.isGroup) {
         return const PqcDecodeError(PqcDecodeFailure.bindingMismatch);
@@ -120,20 +134,28 @@ class PqcV2PrivateCodec {
         return const PqcDecodeError(PqcDecodeFailure.untrustedSender);
       }
       if (!_primitives.verify(
-        message: utf8.encode(jsonEncode(document)),
+        message: utf8.encode(canonicalJsonEncode(document)),
         signatureBase64: signature,
         publicKeyBase64: signingPublicKey,
       )) {
         return const PqcDecodeError(PqcDecodeFailure.corrupted);
       }
 
-      final wraps = (document['wraps'] as List<dynamic>? ?? const [])
-          .whereType<Map<dynamic, dynamic>>()
-          .map(
-            (value) => value.map(
+      final rawWraps = document['wraps'];
+      if (rawWraps != null && rawWraps is! List) {
+        return const PqcDecodeError(PqcDecodeFailure.corrupted);
+      }
+      final wraps = ((rawWraps as List?) ?? const [])
+          .map((value) {
+            if (value is! Map) {
+              throw const FormatException(
+                'Private recipient wraps must be maps.',
+              );
+            }
+            return value.map(
               (key, item) => MapEntry(key.toString(), item.toString()),
-            ),
-          )
+            );
+          })
           .toList(growable: false);
       PqcDeviceKeyset? selectedKeyset;
       Map<String, String>? selectedWrap;
@@ -154,36 +176,47 @@ class PqcV2PrivateCodec {
         return const PqcDecodeError(PqcDecodeFailure.keyMissing);
       }
 
-      final sharedSecret = _primitives.decapsulate(
-        ciphertextBase64: selectedWrap['kem_ciphertext'] ?? '',
-        secretKeyBase64: selectedKeyset.kemSecretKeyBase64,
-      );
-      final wrapKey = await _deriveWrapKey(
-        sharedSecret: sharedSecret,
-        conversation: conversation,
-        senderDeviceId: senderDeviceId,
-        targetDeviceId: selectedKeyset.deviceId,
-      );
-      final contentKey = await _primitives.decryptAead(
-        box: PqcAeadBox(
-          nonce: base64Decode(selectedWrap['nonce'] ?? ''),
-          ciphertext: base64Decode(selectedWrap['ciphertext'] ?? ''),
-          mac: base64Decode(selectedWrap['mac'] ?? ''),
-        ),
-        key: wrapKey,
-      );
-      final clear = await _primitives.decryptAead(
-        box: PqcAeadBox(
-          nonce: base64Decode(document['content_nonce'] as String),
-          ciphertext: base64Decode(document['content_ciphertext'] as String),
-          mac: base64Decode(document['content_mac'] as String),
-        ),
-        key: contentKey,
-      );
-      return PqcDecoded(
-        plaintext: utf8.decode(clear),
-        protocolVersion: PqcV2Wire.protocolVersion,
-      );
+      Uint8List? sharedSecret;
+      Uint8List? wrapKey;
+      Uint8List? contentKey;
+      Uint8List? clear;
+      try {
+        sharedSecret = _primitives.decapsulate(
+          ciphertextBase64: selectedWrap['kem_ciphertext'] ?? '',
+          secretKeyBase64: selectedKeyset.kemSecretKeyBase64,
+        );
+        wrapKey = await _deriveWrapKey(
+          sharedSecret: sharedSecret,
+          conversation: conversation,
+          senderDeviceId: senderDeviceId,
+          targetDeviceId: selectedKeyset.deviceId,
+        );
+        contentKey = await _primitives.decryptAead(
+          box: PqcAeadBox(
+            nonce: base64Decode(selectedWrap['nonce'] ?? ''),
+            ciphertext: base64Decode(selectedWrap['ciphertext'] ?? ''),
+            mac: base64Decode(selectedWrap['mac'] ?? ''),
+          ),
+          key: wrapKey,
+        );
+        clear = await _primitives.decryptAead(
+          box: PqcAeadBox(
+            nonce: base64Decode(document['content_nonce'] as String),
+            ciphertext: base64Decode(document['content_ciphertext'] as String),
+            mac: base64Decode(document['content_mac'] as String),
+          ),
+          key: contentKey,
+        );
+        return PqcDecoded(
+          plaintext: utf8.decode(clear, allowMalformed: false),
+          protocolVersion: PqcV2Wire.protocolVersion,
+        );
+      } finally {
+        secureZero(sharedSecret);
+        secureZero(wrapKey);
+        secureZero(contentKey);
+        secureZero(clear);
+      }
     } catch (error) {
       return PqcDecodeError(
         PqcDecodeFailure.corrupted,
@@ -217,7 +250,9 @@ Map<String, dynamic> _decodeDocument(String encoded) {
     encoded.length + ((4 - encoded.length % 4) % 4),
     '=',
   );
-  final value = jsonDecode(utf8.decode(base64Url.decode(padded)));
+  final value = jsonDecode(
+    utf8.decode(base64Url.decode(padded), allowMalformed: false),
+  );
   if (value is! Map<String, dynamic>) {
     throw const FormatException('Payload document must be an object.');
   }

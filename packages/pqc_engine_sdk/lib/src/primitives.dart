@@ -4,8 +4,9 @@ import 'dart:typed_data';
 
 import 'package:crypto/crypto.dart' as crypto;
 import 'package:cryptography/cryptography.dart';
-import 'package:pqcrypto/pqcrypto.dart';
+import 'package:pqcrypto/pqcrypto.dart' hide secureZero;
 
+import 'crypto_utils.dart';
 import 'models.dart';
 
 class PqcAeadBox {
@@ -20,6 +21,13 @@ class PqcAeadBox {
   final Uint8List nonce;
   final Uint8List ciphertext;
   final Uint8List mac;
+
+  /// Securely overwrites the sensitive cryptographic buffers in place.
+  void zeroize() {
+    secureZero(nonce);
+    secureZero(ciphertext);
+    secureZero(mac);
+  }
 }
 
 class PqcKemEnvelope {
@@ -30,6 +38,11 @@ class PqcKemEnvelope {
 
   final String ciphertextBase64;
   final Uint8List sharedSecret;
+
+  /// Securely overwrites the shared secret bytes in place.
+  void zeroize() {
+    secureZero(sharedSecret);
+  }
 }
 
 abstract interface class PqcPrimitiveSuite {
@@ -54,12 +67,14 @@ abstract interface class PqcPrimitiveSuite {
     required List<int> plaintext,
     required List<int> key,
     required List<int> nonce,
+    List<int> associatedData = const [],
     List<int> aad = const [],
   });
 
   Future<Uint8List> decryptAead({
     required PqcAeadBox box,
     required List<int> key,
+    List<int> associatedData = const [],
     List<int> aad = const [],
   });
 
@@ -76,8 +91,8 @@ abstract interface class PqcPrimitiveSuite {
 }
 
 class DartPqcPrimitiveSuite implements PqcPrimitiveSuite {
-  DartPqcPrimitiveSuite({Random? random})
-    : _random = random ?? Random.secure(),
+  DartPqcPrimitiveSuite()
+    : _random = Random.secure(),
       _kem = PqcKem.kyber768,
       _signingParams = DilithiumParams.mlDsa65,
       _cipher = AesGcm.with256bits();
@@ -103,13 +118,18 @@ class DartPqcPrimitiveSuite implements PqcPrimitiveSuite {
     final (signingPublic, signingSecret) = MlDsa.generateKeyPair(
       _signingParams,
     );
-    return PqcDeviceKeyset(
-      deviceId: deviceId,
-      kemPublicKeyBase64: base64Encode(kemPublic),
-      kemSecretKeyBase64: base64Encode(kemSecret),
-      signingPublicKeyBase64: base64Encode(signingPublic),
-      signingSecretKeyBase64: base64Encode(signingSecret),
-    );
+    try {
+      return PqcDeviceKeyset(
+        deviceId: deviceId,
+        kemPublicKeyBase64: base64Encode(kemPublic),
+        kemSecretKeyBase64: base64Encode(kemSecret),
+        signingPublicKeyBase64: base64Encode(signingPublic),
+        signingSecretKeyBase64: base64Encode(signingSecret),
+      );
+    } finally {
+      secureZero(kemSecret);
+      secureZero(signingSecret);
+    }
   }
 
   @override
@@ -141,7 +161,11 @@ class DartPqcPrimitiveSuite implements PqcPrimitiveSuite {
       kemSecretKeyLength,
       'ML-KEM secret key',
     );
-    return _kem.decapsulate(secretKey, ciphertext);
+    try {
+      return _kem.decapsulate(secretKey, ciphertext);
+    } finally {
+      secureZero(secretKey);
+    }
   }
 
   @override
@@ -151,14 +175,18 @@ class DartPqcPrimitiveSuite implements PqcPrimitiveSuite {
       signingSecretKeyLength,
       'ML-DSA secret key',
     );
-    return base64Encode(
-      MlDsa.sign(
-        secretKey,
-        Uint8List.fromList(message),
-        _signingParams,
-        ctx: Uint8List.fromList(signingContext.codeUnits),
-      ),
-    );
+    try {
+      return base64Encode(
+        MlDsa.sign(
+          secretKey,
+          Uint8List.fromList(message),
+          _signingParams,
+          ctx: Uint8List.fromList(signingContext.codeUnits),
+        ),
+      );
+    } finally {
+      secureZero(secretKey);
+    }
   }
 
   @override
@@ -190,15 +218,17 @@ class DartPqcPrimitiveSuite implements PqcPrimitiveSuite {
     required List<int> plaintext,
     required List<int> key,
     required List<int> nonce,
+    List<int> associatedData = const [],
     List<int> aad = const [],
   }) async {
     _requireLength(key, 32, 'AES-256 key');
     _requireLength(nonce, 12, 'AES-GCM nonce');
+    final effectiveAad = aad.isNotEmpty ? aad : associatedData;
     final box = await _cipher.encrypt(
       plaintext,
       secretKey: SecretKey(key),
       nonce: nonce,
-      aad: aad,
+      aad: effectiveAad,
     );
     return PqcAeadBox(
       nonce: box.nonce,
@@ -211,13 +241,15 @@ class DartPqcPrimitiveSuite implements PqcPrimitiveSuite {
   Future<Uint8List> decryptAead({
     required PqcAeadBox box,
     required List<int> key,
+    List<int> associatedData = const [],
     List<int> aad = const [],
   }) async {
     _requireLength(key, 32, 'AES-256 key');
+    final effectiveAad = aad.isNotEmpty ? aad : associatedData;
     final clear = await _cipher.decrypt(
       SecretBox(box.ciphertext, nonce: box.nonce, mac: Mac(box.mac)),
       secretKey: SecretKey(key),
-      aad: aad,
+      aad: effectiveAad,
     );
     return Uint8List.fromList(clear);
   }
@@ -237,9 +269,16 @@ class DartPqcPrimitiveSuite implements PqcPrimitiveSuite {
   }
 
   @override
-  Uint8List randomBytes(int length) => Uint8List.fromList(
-    List<int>.generate(length, (_) => _random.nextInt(256)),
-  );
+  Uint8List randomBytes(int length) {
+    if (length < 0) {
+      throw ArgumentError.value(length, 'length', 'Must be non-negative.');
+    }
+    final bytes = Uint8List(length);
+    for (var i = 0; i < length; i++) {
+      bytes[i] = _random.nextInt(256);
+    }
+    return bytes;
+  }
 
   @override
   Uint8List sha256(List<int> value) =>

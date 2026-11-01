@@ -4,7 +4,79 @@ import 'dart:math';
 import 'package:pqc_engine_sdk/pqc_engine_sdk.dart';
 import 'package:test/test.dart';
 
+class _ThrowingAtomicStore implements PqcAtomicStore {
+  @override
+  Future<PqcAtomicRecord?> read({
+    required String namespace,
+    required String key,
+  }) async {
+    throw StateError('storage offline');
+  }
+
+  @override
+  Future<bool> compareAndSet({
+    required String namespace,
+    required String key,
+    required int? expectedRevision,
+    required PqcAtomicRecord value,
+  }) async {
+    throw StateError('storage offline');
+  }
+}
+
 void main() {
+  test('keyset ids reject delimiter-bearing device identities', () {
+    expect(
+      () => computeKeysetId('device|collision', 'public-key'),
+      throwsArgumentError,
+    );
+  });
+
+  test('replay claims require a non-empty encrypted payload', () async {
+    final guard = PqcReplayGuard(PqcMemoryReplayStore());
+    await expectLater(
+      guard.claim(
+        accountBinding: pqcAccountBinding('replay-account'),
+        conversationId: 1,
+        messageId: 'message-1',
+        encryptedPayload: '',
+      ),
+      throwsArgumentError,
+    );
+  });
+
+  test('atomic replay store rejects malformed digest input', () async {
+    final store = PqcAtomicReplayStore(PqcMemoryAtomicStore());
+    await expectLater(
+      store.claim(
+        accountBinding: 'binding',
+        conversationId: 1,
+        messageId: 'message-1',
+        payloadDigest: 'not-a-sha256-digest',
+      ),
+      throwsArgumentError,
+    );
+  });
+
+  test('atomic replay store normalizes adapter failures', () async {
+    final store = PqcAtomicReplayStore(_ThrowingAtomicStore());
+    await expectLater(
+      store.claim(
+        accountBinding: 'binding',
+        conversationId: 1,
+        messageId: 'message-1',
+        payloadDigest: 'a' * 64,
+      ),
+      throwsA(
+        isA<PqcVaultException>().having(
+          (error) => error.failure,
+          'failure',
+          PqcVaultFailure.unavailable,
+        ),
+      ),
+    );
+  });
+
   test('malformed private payloads never escape as exceptions', () async {
     final engine = PqcV2Engine();
     final local = engine.primitives.generateDeviceKeyset('local');
@@ -77,6 +149,49 @@ void main() {
         chunkIndex: 2,
       ),
       throwsA(anything),
+    );
+  });
+
+  test('CSPRNG produces non-zero entropy without bitwise 32-bit shift truncation', () {
+    final suite = DartPqcPrimitiveSuite();
+    final bytes32 = suite.randomBytes(32);
+    expect(bytes32.length, 32);
+    expect(bytes32.any((b) => b != 0), isTrue);
+
+    final bytes16 = suite.randomBytes(16);
+    expect(bytes16.length, 16);
+    expect(bytes16.any((b) => b != 0), isTrue);
+  });
+
+  test('PqcGroupSenderKeyEngine rejects truncated recipient wraps (< 28 bytes)', () async {
+    final primitives = DartPqcPrimitiveSuite();
+    final engine = PqcGroupSenderKeyEngine(primitives);
+    final sender = primitives.generateDeviceKeyset('sender');
+    final recipient = primitives.generateDeviceKeyset('recipient');
+
+    final distribution = PqcSenderKeyDistribution(
+      conversationId: 777,
+      epochId: 'ep1',
+      senderDeviceId: sender.deviceId,
+      senderKeysetId: sender.keysetId,
+      signingPublicKey: sender.signingPublicKeyBase64,
+      wraps: [
+        PqcV3RecipientWrap(
+          deviceId: recipient.deviceId,
+          keysetId: recipient.keysetId,
+          kemCiphertext: base64Encode(List.filled(DartPqcPrimitiveSuite.kemCiphertextLength, 1)),
+          wrappedKey: base64Encode([1, 2, 3]), // Only 3 bytes (< 28)
+        ),
+      ],
+    );
+
+    await expectLater(
+      engine.receiveDistribution(
+        distribution: distribution,
+        localKeysets: [recipient],
+        trustedSigningKeysByDevice: {sender.deviceId: {sender.signingPublicKeyBase64}},
+      ),
+      throwsA(isA<FormatException>()),
     );
   });
 }

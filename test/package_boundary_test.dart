@@ -13,7 +13,8 @@ void main() {
         if (entity is! File || !entity.path.endsWith('.dart')) {
           continue;
         }
-        if (entity.path.endsWith('test/package_boundary_test.dart')) {
+        final normalizedPath = entity.path.replaceAll(r'\', '/');
+        if (normalizedPath.endsWith('test/package_boundary_test.dart')) {
           continue;
         }
         final contents = await entity.readAsString();
