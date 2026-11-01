@@ -214,7 +214,7 @@ class GoogleLoginView(APIView):
                 claims = json.loads(response.read().decode('utf-8'))
         except Exception:
             return Response({'detail': 'Google token is invalid.'}, status=401)
-        if claims.get('aud') != settings.GOOGLE_ANDROID_CLIENT_ID:
+        if claims.get('aud') not in settings.GOOGLE_ALLOWED_CLIENT_IDS:
             return Response({'detail': 'Google token audience is invalid.'}, status=401)
         if claims.get('email_verified') not in {'true', True} or not claims.get('sub'):
             return Response({'detail': 'Verified Google account is required.'}, status=401)

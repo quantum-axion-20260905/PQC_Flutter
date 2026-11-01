@@ -30,6 +30,16 @@ GOOGLE_ANDROID_CLIENT_ID = os.environ.get(
     'GOOGLE_ANDROID_CLIENT_ID',
     '937305477350-n9h2s4e6ra9rvs6s1s95gel6p4ldl5tg.apps.googleusercontent.com',
 )
+GOOGLE_ALLOWED_CLIENT_IDS = {
+    cid.strip()
+    for cid in os.environ.get(
+        'GOOGLE_ALLOWED_CLIENT_IDS',
+        f"{GOOGLE_ANDROID_CLIENT_ID},937305477350-jcu55j43afgfku8ff4v3r0a02o7rjfd1.apps.googleusercontent.com",
+    ).split(',')
+    if cid.strip()
+}
+if GOOGLE_ANDROID_CLIENT_ID:
+    GOOGLE_ALLOWED_CLIENT_IDS.add(GOOGLE_ANDROID_CLIENT_ID)
 # Enterprise recovery is backed by AWS KMS in production.  The development
 # adapter is intentionally allowed only outside a production deployment.
 AWS_REGION = os.environ.get('AWS_REGION', '')
